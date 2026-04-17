@@ -226,7 +226,8 @@ create_gpt() {
 	case "$mode" in
 		BIOS) printf '%s\n' \
 			'label: gpt' \
-			'name=system,type=L,bootable,attrs=LegacyBIOSBootable' \
+			'name=bios_boot,type=21686148-6449-6E6F-744E-656564454649,size=1M' \
+			'name=system,type=L,bootable' \
 			| sfdisk "$dev" ;;
 		UEFI) printf '%s\n' \
 			'label: gpt' \
@@ -330,37 +331,31 @@ settle_dev_node() {
 	return 1
 }
 
-# Installs and configures extlinux.
-setup_extlinux() {
-	local mnt="$1"  # path of directory where is root device currently mounted
-	local root_dev="$2"  # root device
-	local modules="$3"  # modules which should be loaded before pivot_root
-	local kernel_flavor="$4"  # name of default kernel to boot
-	local serial_port="$5"  # serial port number for serial console
-	local default_kernel="$kernel_flavor"
-	local kernel_opts=''
+# Installs and configures GRUB bootloader.
+setup_grub() {
+	local mnt="$1"
+	local root_dev="$2"
+	local modules="$3"
+	local kernel_flavor="$4"
+	local serial_port="$5"
+	local root_uuid
+	local kernel_opts=""
 
+	root_uuid=$(blk_uuid "$root_dev")
 	[ -z "$serial_port" ] || kernel_opts="console=$serial_port"
 
-	if [ "$kernel_flavor" = 'virt' ]; then
-		_apk search --root . --exact --quiet linux-lts | grep -q . \
-			&& default_kernel='lts' \
-			|| default_kernel='vanilla'
-	fi
+	grub-install --target=i386-pc --boot-directory="$mnt/boot" "$disk_dev"
 
-	sed -Ei \
-		-e "s|^[# ]*(root)=.*|\1=$root_dev|" \
-		-e "s|^[# ]*(default_kernel_opts)=.*|\1=\"$kernel_opts\"|" \
-		-e "s|^[# ]*(modules)=.*|\1=\"$modules\"|" \
-		-e "s|^[# ]*(default)=.*|\1=$default_kernel|" \
-		-e "s|^[# ]*(serial_port)=.*|\1=$serial_port|" \
-		"$mnt"/etc/update-extlinux.conf
+	cat > "$mnt/boot/grub/grub.cfg" <<-EOF
+	set timeout=1
+	set default=0
 
-	chroot "$mnt" extlinux --install /boot
-	chroot "$mnt" update-extlinux --warn-only 2>&1 \
-		| { grep -Fv 'extlinux: cannot open device /dev' ||:; } >&2
+	menuentry "Alpine Linux" {
+	    linux /boot/vmlinuz-$kernel_flavor root=UUID=$root_uuid rootfstype=$ROOTFS modules=$modules $kernel_opts console=tty0
+	    initrd /boot/initramfs-$kernel_flavor
+	}
+	EOF
 }
-
 # Configures mkinitfs.
 setup_mkinitfs() {
 	local mnt="$1"  # path of directory where is root device currently mounted
@@ -481,6 +476,9 @@ case "$BOOT_MODE" in
 	*) die "Invalid boot-mode: $BOOT_MODE";;
 esac
 
+# GRUB requires a partition table with a BIOS boot partition.
+[ "$BOOT_MODE" = 'BIOS' ] && PARTITION=yes
+
 if [ -f /etc/alpine-release ]; then
 	: ${INSTALL_HOST_PKGS:="yes"}
 else
@@ -515,7 +513,7 @@ if [ "$INSTALL_HOST_PKGS" = yes ]; then
 	fi
 
 	[ "$BOOT_MODE" = 'UEFI' ] && vfatpkg='dosfstools' || vfatpkg=
-	_apk add -t $VIRTUAL_PKG qemu-img $(fs_progs_pkg "$ROOTFS") $vfatpkg rsync sfdisk
+	_apk add -t $VIRTUAL_PKG qemu-img $(fs_progs_pkg "$ROOTFS") $vfatpkg rsync sfdisk grub grub-bios
 fi
 
 #-----------------------------------------------------------------------
@@ -553,7 +551,7 @@ if [ "$PARTITION" = yes ] || [ "$BOOT_MODE" = 'UEFI' ]; then
 	create_gpt "$disk_dev" "$BOOT_MODE"
 
 	if [ "$BOOT_MODE" = 'BIOS' ]; then
-		root_dev="${disk_dev}p1"
+		root_dev="${disk_dev}p2"
 	else
 		esp_dev="${disk_dev}p1"
 		root_dev="${disk_dev}p2"
@@ -571,10 +569,9 @@ if [ "$BOOT_MODE" = 'UEFI' ]; then
 	mkfs.fat -F32 -n EFI "$esp_dev"
 fi
 
-# syslinux 6.0.3 cannot boot from ext4 w/ 64bit feature enabled.
 # -E nodiscard / -K - do not attempt to discard blocks at mkfs time (it's
 # useless for NBD image and prints confusing error).
-[ "$ROOTFS" = ext4 ] && mkfs_args='-O ^64bit -E nodiscard' || mkfs_args='-K'
+[ "$ROOTFS" = ext4 ] && mkfs_args='-E nodiscard' || mkfs_args='-K'
 
 mkfs.$ROOTFS -L root $mkfs_args "$root_dev"
 
@@ -605,8 +602,10 @@ else
 		$ALPINE_MIRROR/$ALPINE_BRANCH/community
 	EOF
      # On s390x, cloud-init packages are not included in stable Alpine branches (v3.x).
-     # They are available only in the edge branch under the community repository.
+     # They are available only in the edge branch. edge/main is needed alongside
+     # edge/community to satisfy python3 version requirements.
      if [ "$ARCH" = "s390x" ]; then
+        echo "$ALPINE_MIRROR/edge/main" >> etc/apk/repositories
         echo "$ALPINE_MIRROR/edge/community" >> etc/apk/repositories
      fi
 fi
@@ -649,15 +648,9 @@ setup_mkinitfs . "base $ROOTFS $INITFS_FEATURES"
 
 #-----------------------------------------------------------------------
 if [ "$BOOT_MODE" = 'BIOS' ]; then
-	einfo 'Setting up extlinux bootloader'
+	einfo 'Setting up GRUB bootloader'
 
-	_apk add --root . --no-scripts syslinux
-	setup_extlinux . "UUID=$root_uuid" "$ROOTFS" "$KERNEL_FLAVOR" "$SERIAL_PORT"
-
-	if [ "$PARTITION" = yes ]; then
-		dd bs=440 count=1 conv=notrunc if=usr/share/syslinux/gptmbr.bin of="$disk_dev"
-		sync
-	fi
+	setup_grub "$mount_dir" "$root_dev" "$ROOTFS" "$KERNEL_FLAVOR" "$SERIAL_PORT"
 fi
 
 #-----------------------------------------------------------------------
