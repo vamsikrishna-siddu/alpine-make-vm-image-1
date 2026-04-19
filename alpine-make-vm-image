@@ -607,6 +607,7 @@ else
      # On s390x, cloud-init packages are not included in stable Alpine branches (v3.x).
      # They are available only in the edge branch under the community repository.
      if [ "$ARCH" = "s390x" ]; then
+        echo "$ALPINE_MIRROR/edge/main" >> etc/apk/repositories
         echo "$ALPINE_MIRROR/edge/community" >> etc/apk/repositories
      fi
 fi
